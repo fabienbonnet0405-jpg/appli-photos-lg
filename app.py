@@ -127,6 +127,8 @@ create table if not exists photos (
 );
 
 alter table if exists products add column if not exists photo_url text;
+alter table if exists products add column if not exists price numeric(10,2);
+alter table if exists products add column if not exists cost  numeric(10,4);
 """
 with engine.begin() as conn:
     conn.exec_driver_sql(SCHEMA_SQL)
@@ -169,18 +171,14 @@ list_tab, import_tab, photo_tab = st.tabs(["Liste produits", "Admin · Import Ex
 @st.cache_data(ttl=60)
 # --- Optimisation : récupérer tout en une requête
 @st.cache_data(ttl=60)
-def load_products(q: str, sel_cats, store_id):
-    """Retourne la liste des produits + dernier prix + dernier coût en une seule requête.
-       => on N'AJOUTE le filtre magasin que si store_id est fourni (pas de NULL).
-    """
-    today = dt.date.today()
-
+def load_products(q: str, sel_cats):
+    """Retourne produits avec price/cost stockés directement dans products."""
     where_sql = """
       where (:q = '' 
          or lower(p.name) like lower('%' || :q || '%') 
          or lower(p.sku)  like lower('%' || :q || '%'))
     """
-    params = {"q": q or "", "today": today}
+    params = {"q": q or ""}
 
     if sel_cats:
         placeholders = ", ".join([f":c{i}" for i in range(len(sel_cats))])
@@ -188,37 +186,11 @@ def load_products(q: str, sel_cats, store_id):
         for i, c in enumerate(sel_cats):
             params[f"c{i}"] = c
 
-    # Clause magasin optionnelle
-    store_clause = ""
-    if store_id:
-        store_clause = " and pr.store_id = :sid "
-        params["sid"] = store_id
-
     sql = f"""
     select
       p.id, p.sku, p.name, p.brand, p.category, p.photo_url,
-      pr.price,
-      co.cost
+      p.price, p.cost
     from products p
-    left join lateral (
-      select pr.price
-      from prices pr
-      where pr.product_id = p.id
-        and pr.valid_from <= :today
-        and (pr.valid_to is null or pr.valid_to >= :today)
-        {store_clause}
-      order by pr.valid_from desc
-      limit 1
-    ) pr on true
-    left join lateral (
-      select c.cost
-      from costs c
-      where c.product_id = p.id
-        and c.valid_from <= :today
-        and (c.valid_to is null or c.valid_to >= :today)
-      order by c.valid_from desc
-      limit 1
-    ) co on true
     {where_sql}
     order by p.name asc
     limit 1000
@@ -246,7 +218,7 @@ with list_tab:
         store = res[0] if res else None
 
     # Chargement optimisé (cache 60s)
-    rows = load_products(q, sel_cats, store["id"] if store else None)
+    rows = load_products(q, sel_cats)
 
     # Pagination
     top = st.columns([1,1,2,2])
@@ -312,120 +284,59 @@ with import_tab:
         st.warning("Réservé aux administrateurs.")
     else:
         st.subheader("Importer un fichier Excel (.xlsx)")
-        st.markdown(
-            "Colonnes attendues : **products**(sku,name,brand,category,status,photo_url) · "
-            "**stores**(code,name,sector_id) · **prices**(sku,store_code,price,valid_from,valid_to) · "
-            "**costs**(sku,cost,valid_from,valid_to)"
-        )
+        st.markdown("Colonnes attendues : sku, name, category, cost, price, photo_url")
 
         # Purge
-        if st.button("⚠️ Purger tous les produits/prix/coûts/photos AVANT d'importer"):
-            execute("delete from photos")
-            execute("delete from prices")
-            execute("delete from costs")
+        if st.button("⚠️ Purger tous les produits AVANT d'importer"):
             execute("delete from products")
-            execute("delete from stores")
             st.success("🧹 Base vidée. Tu peux importer ton Excel proprement.")
             st.cache_data.clear()
 
-        up = st.file_uploader("Dépose ton Excel", type=["xlsx"])
+        up = st.file_uploader("Dépose ton Excel (1 onglet 'catalogue')", type=["xlsx"])
         if up and st.button("Importer"):
             try:
                 data = up.read()
                 wb = pd.ExcelFile(io.BytesIO(data))
 
-                def upsert_products(df: pd.DataFrame):
-                    has_url = "photo_url" in df.columns
-                    for _, r in df.iterrows():
-                        execute(
-                            """
-                            insert into products (id, sku, name, brand, category, status, photo_url)
-                            values (:id, :sku, :name, :brand, :category, coalesce(:status,'active'), :photo_url)
-                            on conflict (sku) do update set
-                              name=excluded.name,
-                              brand=excluded.brand,
-                              category=excluded.category,
-                              status=excluded.status,
-                              photo_url=coalesce(excluded.photo_url, products.photo_url)
-                            """,
-                            id=str(uuid.uuid4()),
-                            sku=str(r["sku"]).strip(),
-                            name=str(r["name"]).strip(),
-                            brand=(r.get("brand") or None),
-                            category=(r.get("category") or None),
-                            status=(r.get("status") or "active"),
-                            photo_url=(str(r["photo_url"]).strip() if has_url and pd.notna(r.get("photo_url")) and str(r["photo_url"]).strip() else None),
-                        )
+                if "catalogue" not in wb.sheet_names:
+                    st.error("L'Excel doit contenir un onglet 'catalogue' avec les colonnes : sku, name, category, cost, price, photo_url.")
+                    st.stop()
 
-                def upsert_stores(df: pd.DataFrame):
-                    for _, r in df.iterrows():
-                        execute(
-                            """
-                            insert into stores (id, code, name, sector_id)
-                            values (:id, :code, :name, :sector)
-                            on conflict (code) do update set name=excluded.name, sector_id=excluded.sector_id
-                            """,
-                            id=str(uuid.uuid4()),
-                            code=str(r["code"]).strip(),
-                            name=str(r["name"]).strip(),
-                            sector=(r.get("sector_id") or None),
-                        )
+                df = wb.parse("catalogue").fillna("")
+                # Nettoyage / typage
+                for col in ["sku","name","category","photo_url"]:
+                    if col in df.columns:
+                        df[col] = df[col].astype(str).str.strip()
+                if "cost" in df.columns:
+                    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+                if "price" in df.columns:
+                    df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
-                def get_product_id(sku: str):
-                    res = fetch_all("select id from products where sku=:sku limit 1", sku=sku)
-                    return res[0]["id"] if res else None
-
-                def get_store_id(code: str):
-                    res = fetch_all("select id from stores where code=:code limit 1", code=code)
-                    return res[0]["id"] if res else None
-
-                if "products" in wb.sheet_names:
-                    upsert_products(wb.parse("products").fillna(""))
-                if "stores" in wb.sheet_names:
-                    upsert_stores(wb.parse("stores").fillna(""))
-
-                if "prices" in wb.sheet_names:
-                    dfp = wb.parse("prices").dropna(subset=["sku", "price", "valid_from"]).fillna("")
-                    for _, r in dfp.iterrows():
-                        pid = get_product_id(str(r["sku"]).strip())
-                        sid = get_store_id(str(r.get("store_code", "")).strip()) if r.get("store_code", "") else None
-                        if not pid:
-                            continue
-                        execute(
-                            """
-                            insert into prices (id, product_id, store_id, price, valid_from, valid_to)
-                            values (:id, :pid, :sid, :price, :vf, :vt)
-                            on conflict do nothing
-                            """,
-                            id=str(uuid.uuid4()),
-                            pid=pid,
-                            sid=sid,
-                            price=float(r["price"]),
-                            vf=pd.to_datetime(r["valid_from"]).date(),
-                            vt=(pd.to_datetime(r.get("valid_to")).date() if str(r.get("valid_to", "")) else None),
-                        )
-
-                if "costs" in wb.sheet_names:
-                    dfc = wb.parse("costs").dropna(subset=["sku", "cost", "valid_from"]).fillna("")
-                    for _, r in dfc.iterrows():
-                        pid = get_product_id(str(r["sku"]).strip())
-                        if not pid:
-                            continue
-                        execute(
-                            """
-                            insert into costs (id, product_id, cost, valid_from, valid_to)
-                            values (:id, :pid, :cost, :vf, :vt)
-                            on conflict do nothing
-                            """,
-                            id=str(uuid.uuid4()),
-                            pid=pid,
-                            cost=float(r["cost"]),
-                            vf=pd.to_datetime(r["valid_from"]).date(),
-                            vt=(pd.to_datetime(r.get("valid_to")).date() if str(r.get("valid_to", "")) else None),
-                        )
+                # Upsert direct dans products (modèle simple)
+                for _, r in df.iterrows():
+                    execute(
+                        """
+                        insert into products (id, sku, name, category, status, photo_url, price, cost)
+                        values (:id, :sku, :name, :category, 'active', :photo_url, :price, :cost)
+                        on conflict (sku) do update set
+                          name=excluded.name,
+                          category=excluded.category,
+                          status='active',
+                          photo_url=coalesce(nullif(excluded.photo_url, ''), products.photo_url),
+                          price=excluded.price,
+                          cost=excluded.cost
+                        """,
+                        id=str(uuid.uuid4()),
+                        sku=r["sku"],
+                        name=r["name"],
+                        category=(r["category"] or None),
+                        photo_url=(r["photo_url"] or None),
+                        price=(float(r["price"]) if pd.notna(r["price"]) else None),
+                        cost=(float(r["cost"]) if pd.notna(r["cost"]) else None),
+                    )
 
                 st.cache_data.clear()
-                st.success("✅ Import terminé.")
+                st.success("✅ Import terminé (modèle simple).")
             except Exception as e:
                 st.exception(e)
 
