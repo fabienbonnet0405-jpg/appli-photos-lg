@@ -23,6 +23,26 @@ except Exception:
 # --- Config de la page
 st.set_page_config(page_title="Produits & Rentabilité", page_icon="📦", layout="wide")
 
+# ---- Gate d'accès par mot de passe (optionnel)
+APP_PWD = None
+try:
+    if hasattr(st, "secrets"):
+        APP_PWD = st.secrets.get("APP_PASSWORD")
+except Exception:
+    pass
+
+if APP_PWD:
+    if "auth_ok" not in st.session_state:
+        st.session_state.auth_ok = False
+    if not st.session_state.auth_ok:
+        pwd_in = st.text_input("Mot de passe d'accès (test)", type="password")
+        if st.button("Entrer"):
+            st.session_state.auth_ok = (pwd_in == APP_PWD)
+            if not st.session_state.auth_ok:
+                st.error("Mot de passe incorrect.")
+        st.stop()
+
+
 # --- Charger les secrets Streamlit dans les env vars (utile en Cloud)
 try:
     if hasattr(st, "secrets") and "NEON_DATABASE_URL" not in os.environ:
@@ -153,15 +173,34 @@ with list_tab:
     col1, col2 = st.columns([2, 1])
     q = col1.text_input("Recherche", placeholder="Nom ou SKU…")
     store_code = col2.text_input("Code magasin (optionnel)")
+    # --- Filtre catégorie
+    all_cats = [r["category"] for r in fetch_all("select distinct category from products where category is not null order by 1")]
+    sel_cats = st.multiselect("Catégories", options=all_cats, default=[])
+
+    # Construction dynamique du WHERE (nom/SKU + catégories)
+    where_sql = """
+        where (:q = '' 
+           or lower(name) like lower('%' || :q || '%') 
+           or lower(sku) like lower('%' || :q || '%'))
+    """
+    params = {"q": q or ""}
+
+    if sel_cats:
+        # on fabrique un IN (:c0,:c1,...) pour éviter les soucis d'array binding
+        placeholders = ", ".join([f":c{i}" for i in range(len(sel_cats))])
+        where_sql += f" and category in ({placeholders})"
+        for i, c in enumerate(sel_cats):
+            params[f"c{i}"] = c
 
     rows = fetch_all(
-        """
-        select id, sku, name, brand, category from products
-        where (:q = '' or lower(name) like lower('%' || :q || '%') or lower(sku) like lower('%' || :q || '%'))
+        f"""
+        select id, sku, name, brand, category 
+        from products
+        {where_sql}
         order by name asc
         limit 500
         """,
-        q=q or "",
+        **params,
     )
 
     st.caption(f"{len(rows)} produit(s)")
