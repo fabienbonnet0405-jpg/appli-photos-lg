@@ -1,0 +1,6 @@
+streamlit
+pandas
+sqlalchemy
+pg8000
+openpyxl
+boto3
