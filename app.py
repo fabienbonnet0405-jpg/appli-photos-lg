@@ -1,6 +1,6 @@
 # =================
-# app.py  — Streamlit + Neon (Postgres) + (optionnel) Cloudflare R2
-# (aucune dépendance à Supabase)
+# app.py — Streamlit + Neon (Postgres) (+ Cloudflare R2 optionnel)
+# Optimisations : 1 seule requête SQL, cache, filtre catégories, pagination
 # =================
 import os
 import io
@@ -12,7 +12,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# --- Boto3 (optionnel pour R2)
+# --- (optionnel) R2
 try:
     import boto3
     from botocore.client import Config
@@ -20,10 +20,10 @@ except Exception:
     boto3 = None
     Config = None
 
-# --- Config de la page
+# --- Page config
 st.set_page_config(page_title="Produits & Rentabilité", page_icon="📦", layout="wide")
 
-# ---- Gate d'accès par mot de passe (optionnel)
+# --- Gate par mot de passe (secret APP_PASSWORD à définir sur Streamlit Cloud)
 APP_PWD = None
 try:
     if hasattr(st, "secrets"):
@@ -42,8 +42,7 @@ if APP_PWD:
                 st.error("Mot de passe incorrect.")
         st.stop()
 
-
-# --- Charger les secrets Streamlit dans les env vars (utile en Cloud)
+# --- Charger secrets dans env si besoin (utile en Cloud)
 try:
     if hasattr(st, "secrets") and "NEON_DATABASE_URL" not in os.environ:
         for k, v in st.secrets.items():
@@ -51,7 +50,7 @@ try:
 except Exception:
     pass
 
-# --- Récupération des variables d'env
+# --- Env vars
 NEON_DATABASE_URL = os.environ.get("NEON_DATABASE_URL")  # ex: postgresql+pg8000://user:pass@host/neondb
 R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
@@ -59,20 +58,18 @@ R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
 R2_BUCKET = os.environ.get("R2_BUCKET", "photos")
 
 if not NEON_DATABASE_URL:
-    st.error("⚠️ NEON_DATABASE_URL manquante. Renseigne-la via $env:NEON_DATABASE_URL ou .streamlit/secrets.toml")
+    st.error("⚠️ NEON_DATABASE_URL manquante. Renseigne-la dans Advanced settings → Secrets.")
     st.stop()
 
-# --- IMPORTANT: URL sans paramètres SSL ; on fournit le contexte SSL au driver pg8000 via connect_args
-# Exemple d’URL:
-#   postgresql+pg8000://neondb_owner:TON_MDP@ep-xxxxx.eu-central-1.aws.neon.tech/neondb
+# --- SQLAlchemy engine (pg8000 + SSL)
 ssl_ctx = ssl.create_default_context()
 engine: Engine = create_engine(
-    NEON_DATABASE_URL,                   # doit être en pg8000
-    connect_args={"ssl_context": ssl_ctx},  # ✅ pg8000 attend ssl_context (pas "ssl=True")
+    NEON_DATABASE_URL,                   # format: postgresql+pg8000://...
+    connect_args={"ssl_context": ssl_ctx},
     pool_pre_ping=True,
 )
 
-# --- Client Cloudflare R2 (facultatif)
+# --- Client Cloudflare R2 (optionnel)
 r2 = None
 if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and boto3:
     r2 = boto3.client(
@@ -84,9 +81,9 @@ if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and boto3:
         region_name="auto",
     )
 
-# --- Schéma minimal (création si absent)
+# --- Schéma minimal
 SCHEMA_SQL = """
-create extension if not exists pgcrypto; -- pour gen_random_uuid();
+create extension if not exists pgcrypto;
 
 create table if not exists products (
   id uuid primary key default gen_random_uuid(),
@@ -129,7 +126,6 @@ create table if not exists photos (
   taken_at timestamptz default now()
 );
 
--- Ajoute la colonne photo_url si elle n'existe pas
 alter table if exists products add column if not exists photo_url text;
 """
 with engine.begin() as conn:
@@ -145,7 +141,7 @@ def execute(sql: str, **params):
     with engine.begin() as conn:
         conn.execute(text(sql), params)
 
-# --- Auth minimal
+# --- Auth minimal (email / rôle)
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -168,56 +164,107 @@ st.title("📦 Produits, Prix & Rentabilité — Neon (+ R2 optionnel)")
 list_tab, import_tab, photo_tab = st.tabs(["Liste produits", "Admin · Import Excel", "Photos"])
 
 # ======================
+# Loader optimisé : 1 seule requête + cache (60s)
+# ======================
+@st.cache_data(ttl=60)
+# --- Optimisation : récupérer tout en une requête
+@st.cache_data(ttl=60)
+def load_products(q: str, sel_cats, store_id):
+    """Retourne la liste des produits + dernier prix + dernier coût en une seule requête.
+       => on N'AJOUTE le filtre magasin que si store_id est fourni (pas de NULL).
+    """
+    today = dt.date.today()
+
+    where_sql = """
+      where (:q = '' 
+         or lower(p.name) like lower('%' || :q || '%') 
+         or lower(p.sku)  like lower('%' || :q || '%'))
+    """
+    params = {"q": q or "", "today": today}
+
+    if sel_cats:
+        placeholders = ", ".join([f":c{i}" for i in range(len(sel_cats))])
+        where_sql += f" and p.category in ({placeholders})"
+        for i, c in enumerate(sel_cats):
+            params[f"c{i}"] = c
+
+    # Clause magasin optionnelle
+    store_clause = ""
+    if store_id:
+        store_clause = " and pr.store_id = :sid "
+        params["sid"] = store_id
+
+    sql = f"""
+    select
+      p.id, p.sku, p.name, p.brand, p.category, p.photo_url,
+      pr.price,
+      co.cost
+    from products p
+    left join lateral (
+      select pr.price
+      from prices pr
+      where pr.product_id = p.id
+        and pr.valid_from <= :today
+        and (pr.valid_to is null or pr.valid_to >= :today)
+        {store_clause}
+      order by pr.valid_from desc
+      limit 1
+    ) pr on true
+    left join lateral (
+      select c.cost
+      from costs c
+      where c.product_id = p.id
+        and c.valid_from <= :today
+        and (c.valid_to is null or c.valid_to >= :today)
+      order by c.valid_from desc
+      limit 1
+    ) co on true
+    {where_sql}
+    order by p.name asc
+    limit 1000
+    """
+    return fetch_all(sql, **params)
+
+# ======================
 # Liste produits
+# ======================
 with list_tab:
     col1, col2 = st.columns([2, 1])
     q = col1.text_input("Recherche", placeholder="Nom ou SKU…")
     store_code = col2.text_input("Code magasin (optionnel)")
-    # --- Filtre catégorie
-    all_cats = [r["category"] for r in fetch_all("select distinct category from products where category is not null order by 1")]
+
+    # Filtre catégories (via base)
+    all_cats = [r["category"] for r in fetch_all(
+        "select distinct category from products where category is not null order by 1"
+    )]
     sel_cats = st.multiselect("Catégories", options=all_cats, default=[])
 
-    # Construction dynamique du WHERE (nom/SKU + catégories)
-    where_sql = """
-        where (:q = '' 
-           or lower(name) like lower('%' || :q || '%') 
-           or lower(sku) like lower('%' || :q || '%'))
-    """
-    params = {"q": q or ""}
-
-    if sel_cats:
-        # on fabrique un IN (:c0,:c1,...) pour éviter les soucis d'array binding
-        placeholders = ", ".join([f":c{i}" for i in range(len(sel_cats))])
-        where_sql += f" and category in ({placeholders})"
-        for i, c in enumerate(sel_cats):
-            params[f"c{i}"] = c
-
-    rows = fetch_all(
-        f"""
-        select id, sku, name, brand, category 
-        from products
-        {where_sql}
-        order by name asc
-        limit 500
-        """,
-        **params,
-    )
-
-    st.caption(f"{len(rows)} produit(s)")
-    cols = st.columns(3)
-
+    # Résolution store_id une seule fois
     store = None
     if store_code:
         res = fetch_all("select id, code from stores where code = :code limit 1", code=store_code)
         store = res[0] if res else None
 
-    for i, r in enumerate(rows):
-        with cols[i % 3]:
-            # --- Récup photo produit
-            photo_url_row = fetch_all("select photo_url from products where id=:pid", pid=r["id"])
-            img_src = photo_url_row[0]["photo_url"] if photo_url_row and photo_url_row[0]["photo_url"] else "https://placehold.co/600x400?text=Photo"
+    # Chargement optimisé (cache 60s)
+    rows = load_products(q, sel_cats, store["id"] if store else None)
 
-            # --- Vignette uniforme
+    # Pagination
+    top = st.columns([1,1,2,2])
+    with top[0]:
+        page_size = st.selectbox("Cartes/page", [6, 12, 24, 48], index=1)
+    with top[1]:
+        page = st.number_input("Page", min_value=1, value=1, step=1)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_rows = rows[start:end]
+
+    st.caption(f"{len(rows)} produit(s) — page {page} ({len(page_rows)} affichés)")
+    cols = st.columns(3)
+
+    for i, r in enumerate(page_rows):
+        with cols[i % 3]:
+            # IMAGE (photo_url prioritaire / placeholder sinon)
+            img_src = r.get("photo_url") or "https://placehold.co/600x400?text=Photo"
             st.markdown(
                 f'''
                 <div style="
@@ -232,60 +279,33 @@ with list_tab:
                 unsafe_allow_html=True
             )
 
-            # --- Titre + SKU (une seule fois !)
+            # TITRE / SKU
             st.subheader(r["name"])
             st.caption(f"SKU: {r['sku']} · {r.get('brand') or ''}")
 
-            # --- Prix / coût / marge
-            today = dt.date.today()
-            price_sql = """
-                select price from prices
-                where product_id=:pid
-                  and valid_from <= :today
-                  and (valid_to is null or valid_to >= :today)
-            """
-            price_params = {"pid": r["id"], "today": today}
-            if store:
-                price_sql += " and store_id = :sid"
-                price_params["sid"] = store["id"]
-            price_sql += " order by valid_from desc limit 1"
-            price = fetch_all(price_sql, **price_params)
+            # PV / COUT / MARGE / COEFF (déjà chargés)
+            pv = float(r["price"]) if r.get("price") is not None else None
+            c  = float(r["cost"])  if r.get("cost")  is not None else None
 
-            cost = fetch_all(
-                """
-                select cost from costs
-                where product_id=:pid
-                  and valid_from <= :today
-                  and (valid_to is null or valid_to >= :today)
-                order by valid_from desc
-                limit 1
-                """,
-                pid=r["id"], today=today,
-            )
-
-            if price:
-                pv = float(price[0]["price"])
-                if cost:
-                    c = float(cost[0]["cost"])
+            if pv is None:
+                st.markdown("*Pas de prix actif*")
+            else:
+                if c is not None:
                     m_eur = pv - c
                     m_pct = (m_eur / pv * 100) if pv else 0
-                    coeff = pv / c if c else 0
+                    coeff = (pv / c) if c else 0
                     badge = "🟢" if m_pct >= 20 else ("🟠" if m_pct >= 10 else "🔴")
+                    coeff_badge = "🟢" if coeff >= 1.30 else ("🟠" if coeff >= 1.20 else "🔴")
                     st.markdown(
                         f"**PV**: {pv:.2f} € · **Coût**: {c:.2f} € · "
-                        f"**Marge**: {m_eur:.2f} € ({m_pct:.0f}%) · "
-                        f"**Coeff**: {coeff:.2f} {badge}"
+                        f"**Marge**: {m_eur:.2f} € ({m_pct:.0f}%) {badge} · "
+                        f"**Coeff**: {coeff:.2f} {coeff_badge}"
                     )
                 else:
-                    st.markdown(f"**PV**: {pv:.2f} €")
-            else:
-                st.markdown("*Pas de prix actif*")
-
-            # --- fin carte
-            st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown(f"**PV**: {pv:.2f} € · *Coût inconnu*")
 
 # ======================
-# Import Excel (admin uniquement)
+# Admin · Import Excel (réservé admin)
 # ======================
 with import_tab:
     if user["role"] != "admin":
@@ -298,7 +318,7 @@ with import_tab:
             "**costs**(sku,cost,valid_from,valid_to)"
         )
 
-        # -------- BTN PURGE AVANT IMPORT --------
+        # Purge
         if st.button("⚠️ Purger tous les produits/prix/coûts/photos AVANT d'importer"):
             execute("delete from photos")
             execute("delete from prices")
@@ -306,16 +326,14 @@ with import_tab:
             execute("delete from products")
             execute("delete from stores")
             st.success("🧹 Base vidée. Tu peux importer ton Excel proprement.")
-        # ----------------------------------------
+            st.cache_data.clear()
 
         up = st.file_uploader("Dépose ton Excel", type=["xlsx"])
-
         if up and st.button("Importer"):
             try:
                 data = up.read()
                 wb = pd.ExcelFile(io.BytesIO(data))
 
-                # ---- Upserts
                 def upsert_products(df: pd.DataFrame):
                     has_url = "photo_url" in df.columns
                     for _, r in df.iterrows():
@@ -361,7 +379,6 @@ with import_tab:
                     res = fetch_all("select id from stores where code=:code limit 1", code=code)
                     return res[0]["id"] if res else None
 
-                # ---- Lecture des onglets
                 if "products" in wb.sheet_names:
                     upsert_products(wb.parse("products").fillna(""))
                 if "stores" in wb.sheet_names:
@@ -407,6 +424,7 @@ with import_tab:
                             vt=(pd.to_datetime(r.get("valid_to")).date() if str(r.get("valid_to", "")) else None),
                         )
 
+                st.cache_data.clear()
                 st.success("✅ Import terminé.")
             except Exception as e:
                 st.exception(e)
