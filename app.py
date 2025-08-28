@@ -20,8 +20,19 @@ except Exception:
     boto3 = None
     Config = None
 
-# --- Page config
-st.set_page_config(page_title="Produits & Rentabilité", page_icon="📦", layout="wide")
+# --- Config de la page
+st.set_page_config(
+    page_title="Catalogue Produits — TechSell × LG",
+    page_icon="https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/LG%20LOGO.png",
+    layout="wide",
+)
+
+# --- Logo en header
+st.image(
+    "https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/Logo%20Techsell.jpg",
+    width=200
+)
+st.title("🛒 Catalogue Produits — TechSell")
 
 # --- Gate par mot de passe (secret APP_PASSWORD à définir sur Streamlit Cloud)
 APP_PWD = None
@@ -161,8 +172,36 @@ if not user:
     st.info("🔐 Connecte-toi dans la barre latérale pour continuer.")
     st.stop()
 
-# --- UI
-st.title("📦 Produits, Prix & Rentabilité — Neon (+ R2 optionnel)")
+# --- Header compact LG (propre et centré à gauche)
+LOGO_LG = "https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/LG%20LOGO.png"
+
+st.markdown(
+    f"""
+    <style>
+      .app-header {{
+        display: flex; align-items: center; gap: 14px;
+        margin: 4px 0 18px;
+      }}
+      .app-header img {{
+        height: 40px; width: auto; border-radius: 4px;
+      }}
+      .app-title {{
+        font-size: 26px; font-weight: 700; margin: 0; line-height: 1.2;
+      }}
+      .app-sub {{
+        font-size: 14px; color: #6b7280; margin: 0; line-height: 1.2;
+      }}
+    </style>
+    <div class="app-header">
+      <img src="{LOGO_LG}" alt="LG">
+      <div>
+        <p class="app-title">Catalogue Produits</p>
+        <p class="app-sub">TechSell × LG</p>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 list_tab, import_tab, photo_tab = st.tabs(["Liste produits", "Admin · Import Excel", "Photos"])
 
 # ======================
