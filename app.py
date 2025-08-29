@@ -1,6 +1,7 @@
 # =================
 # app.py — Streamlit + Neon (Postgres) (+ Cloudflare R2 optionnel)
-# Optimisations : 1 seule requête SQL, cache, filtre catégories, pagination
+# Modèle simple : 1 onglet Excel `catalogue` (sku, name, category, cost, price, spe1, spe2, spe3, photo_url)
+# Optimisations : 1 requête SQL, cache, filtre catégories, pagination
 # =================
 import os
 import io
@@ -12,7 +13,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# --- (optionnel) R2
+# --- (optionnel) Cloudflare R2
 try:
     import boto3
     from botocore.client import Config
@@ -20,19 +21,12 @@ except Exception:
     boto3 = None
     Config = None
 
-# --- Config de la page
+# --- Config de la page (favicon LG)
 st.set_page_config(
     page_title="Catalogue Produits — TechSell × LG",
     page_icon="https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/LG%20LOGO.png",
     layout="wide",
 )
-
-# --- Logo en header
-st.image(
-    "https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/Logo%20Techsell.jpg",
-    width=200
-)
-st.title("🛒 Catalogue Produits — TechSell")
 
 # --- Gate par mot de passe (secret APP_PASSWORD à définir sur Streamlit Cloud)
 APP_PWD = None
@@ -92,7 +86,7 @@ if R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and boto3:
         region_name="auto",
     )
 
-# --- Schéma minimal
+# --- Schéma minimal (création/alter si absent)
 SCHEMA_SQL = """
 create extension if not exists pgcrypto;
 
@@ -140,6 +134,9 @@ create table if not exists photos (
 alter table if exists products add column if not exists photo_url text;
 alter table if exists products add column if not exists price numeric(10,2);
 alter table if exists products add column if not exists cost  numeric(10,4);
+alter table if exists products add column if not exists spec1 text;
+alter table if exists products add column if not exists spec2 text;
+alter table if exists products add column if not exists spec3 text;
 """
 with engine.begin() as conn:
     conn.exec_driver_sql(SCHEMA_SQL)
@@ -172,9 +169,8 @@ if not user:
     st.info("🔐 Connecte-toi dans la barre latérale pour continuer.")
     st.stop()
 
-# --- Header compact LG (propre et centré à gauche)
+# --- Header compact LG (logo + titre + sous-titre)
 LOGO_LG = "https://raw.githubusercontent.com/fabienbonnet0405-jpg/appli-photos-lg/main/LG%20LOGO.png"
-
 st.markdown(
     f"""
     <style>
@@ -202,16 +198,15 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 list_tab, import_tab, photo_tab = st.tabs(["Liste produits", "Admin · Import Excel", "Photos"])
 
 # ======================
 # Loader optimisé : 1 seule requête + cache (60s)
 # ======================
 @st.cache_data(ttl=60)
-# --- Optimisation : récupérer tout en une requête
-@st.cache_data(ttl=60)
 def load_products(q: str, sel_cats):
-    """Retourne produits avec price/cost stockés directement dans products."""
+    """Retourne produits avec price/cost + specs (modèle simple)."""
     where_sql = """
       where (:q = '' 
          or lower(p.name) like lower('%' || :q || '%') 
@@ -228,7 +223,8 @@ def load_products(q: str, sel_cats):
     sql = f"""
     select
       p.id, p.sku, p.name, p.brand, p.category, p.photo_url,
-      p.price, p.cost
+      p.price, p.cost,
+      p.spec1, p.spec2, p.spec3
     from products p
     {where_sql}
     order by p.name asc
@@ -242,19 +238,12 @@ def load_products(q: str, sel_cats):
 with list_tab:
     col1, col2 = st.columns([2, 1])
     q = col1.text_input("Recherche", placeholder="Nom ou SKU…")
-    store_code = col2.text_input("Code magasin (optionnel)")
 
     # Filtre catégories (via base)
     all_cats = [r["category"] for r in fetch_all(
         "select distinct category from products where category is not null order by 1"
     )]
     sel_cats = st.multiselect("Catégories", options=all_cats, default=[])
-
-    # Résolution store_id une seule fois
-    store = None
-    if store_code:
-        res = fetch_all("select id, code from stores where code = :code limit 1", code=store_code)
-        store = res[0] if res else None
 
     # Chargement optimisé (cache 60s)
     rows = load_products(q, sel_cats)
@@ -294,7 +283,18 @@ with list_tab:
             st.subheader(r["name"])
             st.caption(f"SKU: {r['sku']} · {r.get('brand') or ''}")
 
-            # PV / COUT / MARGE / COEFF (déjà chargés)
+            # SPECS (liste à puces si présentes)
+            specs = [r.get("spec1"), r.get("spec2"), r.get("spec3")]
+            specs = [s for s in specs if s and str(s).strip()]
+            if specs:
+                st.markdown(
+                    "<ul style='margin:0 0 8px 18px;padding:0;color:#374151;'>"
+                    + "".join([f"<li style='margin:0;'>{str(s)}</li>" for s in specs])
+                    + "</ul>",
+                    unsafe_allow_html=True
+                )
+
+            # PV / COUT / MARGE / COEFF (si présents)
             pv = float(r["price"]) if r.get("price") is not None else None
             c  = float(r["cost"])  if r.get("cost")  is not None else None
 
@@ -323,7 +323,7 @@ with import_tab:
         st.warning("Réservé aux administrateurs.")
     else:
         st.subheader("Importer un fichier Excel (.xlsx)")
-        st.markdown("Colonnes attendues : sku, name, category, cost, price, photo_url")
+        st.markdown("Colonnes attendues : sku, name, category, cost, price, spe1, spe2, spe3, photo_url")
 
         # Purge
         if st.button("⚠️ Purger tous les produits AVANT d'importer"):
@@ -338,12 +338,16 @@ with import_tab:
                 wb = pd.ExcelFile(io.BytesIO(data))
 
                 if "catalogue" not in wb.sheet_names:
-                    st.error("L'Excel doit contenir un onglet 'catalogue' avec les colonnes : sku, name, category, cost, price, photo_url.")
+                    st.error("L'Excel doit contenir un onglet 'catalogue' avec les colonnes : sku, name, category, cost, price, spe1, spe2, spe3, photo_url.")
                     st.stop()
 
                 df = wb.parse("catalogue").fillna("")
+
+                # mapper spe1/2/3 (Excel) -> spec1/2/3 (DB)
+                df = df.rename(columns={"spe1": "spec1", "spe2": "spec2", "spe3": "spec3"})
+
                 # Nettoyage / typage
-                for col in ["sku","name","category","photo_url"]:
+                for col in ["sku","name","category","photo_url","spec1","spec2","spec3"]:
                     if col in df.columns:
                         df[col] = df[col].astype(str).str.strip()
                 if "cost" in df.columns:
@@ -355,27 +359,33 @@ with import_tab:
                 for _, r in df.iterrows():
                     execute(
                         """
-                        insert into products (id, sku, name, category, status, photo_url, price, cost)
-                        values (:id, :sku, :name, :category, 'active', :photo_url, :price, :cost)
+                        insert into products (id, sku, name, category, status, photo_url, price, cost, spec1, spec2, spec3)
+                        values (:id, :sku, :name, :category, 'active', :photo_url, :price, :cost, :spec1, :spec2, :spec3)
                         on conflict (sku) do update set
                           name=excluded.name,
                           category=excluded.category,
                           status='active',
                           photo_url=coalesce(nullif(excluded.photo_url, ''), products.photo_url),
                           price=excluded.price,
-                          cost=excluded.cost
+                          cost=excluded.cost,
+                          spec1=nullif(excluded.spec1, ''),
+                          spec2=nullif(excluded.spec2, ''),
+                          spec3=nullif(excluded.spec3, '')
                         """,
                         id=str(uuid.uuid4()),
-                        sku=r["sku"],
-                        name=r["name"],
-                        category=(r["category"] or None),
-                        photo_url=(r["photo_url"] or None),
-                        price=(float(r["price"]) if pd.notna(r["price"]) else None),
-                        cost=(float(r["cost"]) if pd.notna(r["cost"]) else None),
+                        sku=r.get("sku","").strip(),
+                        name=r.get("name","").strip(),
+                        category=(r.get("category") or None),
+                        photo_url=(r.get("photo_url") or None),
+                        price=(float(r["price"]) if pd.notna(r.get("price")) else None),
+                        cost=(float(r["cost"]) if pd.notna(r.get("cost")) else None),
+                        spec1=(r.get("spec1") or None),
+                        spec2=(r.get("spec2") or None),
+                        spec3=(r.get("spec3") or None),
                     )
 
                 st.cache_data.clear()
-                st.success("✅ Import terminé (modèle simple).")
+                st.success("✅ Import terminé (avec caractéristiques).")
             except Exception as e:
                 st.exception(e)
 
